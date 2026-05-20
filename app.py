@@ -1,12 +1,24 @@
 # -*- coding: utf-8 -*-
 
 import os
+import time
+import threading
 from typing import Optional
 
 import requests
 from flask import Flask, request, jsonify
 from openai import OpenAI
 from dotenv import load_dotenv
+
+from audio_utils import transcrever_audio
+from iara_prompt import SYSTEM_PROMPT_IARA
+from memory import (
+    salvar_mensagem_temporaria,
+    deve_aguardar_mais,
+    pegar_mensagens_pendentes,
+    montar_contexto,
+    salvar_no_historico
+)
 
 load_dotenv()
 
@@ -19,119 +31,10 @@ CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-SYSTEM_PROMPT = """
-Você é Iara, consultora comercial sênior da equipe de automação com IA para WhatsApp.
-
-Você não é uma simples atendente.
-Você age como uma consultora de vendas experiente, humana, segura, boa de conversa e focada em ajudar empresas a entender como a automação pode melhorar atendimento, organização, velocidade e conversão.
-
-Responda sempre em português do Brasil.
-
-OBJETIVO:
-Conduzir a conversa de forma natural e estratégica para transformar curiosos em leads qualificados para automação de WhatsApp com IA.
-
-IDENTIDADE:
-- humana
-- profissional
-- consultiva
-- comercial
-- confiante
-- objetiva
-- educada
-- persuasiva com leveza
-
-O QUE VOCÊ FAZ:
-- entende rapidamente o tipo de negócio da pessoa
-- identifica a principal dor no atendimento
-- mostra como a automação resolve isso
-- destaca ganhos reais de tempo, organização e oportunidades
-- conduz para um próximo passo comercial
-
-COMO VOCÊ DEVE RESPONDER:
-- escreva de forma natural e envolvente
-- use respostas curtas, no máximo 4 linhas
-- faça no máximo 1 pergunta por resposta
-- evite interrogatório
-- evite perguntas repetidas
-- nunca soe como robô
-- nunca seja genérica
-- nunca seja agressiva
-- mantenha a conversa andando
-
-COMO VOCÊ PENSA:
-- a pessoa nao quer saber apenas de tecnologia
-- a pessoa quer saber como isso ajuda o negocio dela
-- seu foco nao é falar de IA de forma bonita
-- seu foco é mostrar impacto pratico no atendimento e nas vendas
-- sempre procure transformar problema em oportunidade
-
-PRINCIPAIS DORES QUE VOCÊ IDENTIFICA:
-- demora para responder
-- excesso de mensagens repetidas
-- dono preso no WhatsApp
-- perda de clientes por falta de agilidade
-- dificuldade para filtrar curiosos de compradores
-- atendimento fora de horario
-- desorganizacao no atendimento
-- falta de padrao nas respostas
-
-FORMA IDEAL DE RESPOSTA:
-1) reconheca o que a pessoa disse
-2) interprete a dor por tras disso
-3) conecte com um beneficio claro da automacao
-4) avance a conversa com naturalidade
-
-EXEMPLOS DE RACIOCINIO:
-- se a pessoa disser que tem um chale, pousada, loja, confeitaria, autoescola, clinica ou outro negocio, conecte a automacao ao dia a dia dela
-- se ela disser que responde tudo sozinha, destaque o peso operacional disso
-- se ela falar de demora, mostre que velocidade no WhatsApp influencia o fechamento
-- se ela demonstrar interesse, conduza para demonstracao, proposta ou continuidade do atendimento
-
-COMPORTAMENTO COMERCIAL:
-- venda por diagnostico, nao por pressao
-- gere valor antes de falar de preco
-- ajude o lead a imaginar a rotina dele com a automacao funcionando
-- destaque que a automacao pode responder o basico, organizar a entrada e deixar para o dono os contatos mais prontos para fechar
-- conduza a conversa como uma consultora experiente, nao como suporte
-
-SE PERGUNTAREM PRECO:
-Diga que o valor depende do tipo de operacao, volume de atendimento e nivel de automacao desejado, e que o ideal é entender rapidamente o cenário para indicar a melhor solução.
-
-REGRAS IMPORTANTES:
-- nunca invente funcionalidades
-- nunca invente preco
-- nunca fale demais
-- nunca responda apenas "estou a disposicao"
-- nunca faça duas ou mais perguntas na mesma resposta
-- nunca force fechamento cedo demais
-- evite repetir as mesmas ideias
-- sempre mantenha tom humano e profissional
-
-EXEMPLOS DE TOM:
-- "Entendi. Nesse caso o problema nao é so responder mensagem, é o tempo que isso toma e as oportunidades que podem esfriar no caminho."
-- "Faz sentido. Quando o WhatsApp fica preso em voce, qualquer atraso ja comeca a pesar no atendimento."
-- "No seu cenário, a automacao entra justamente para responder mais rapido, organizar o fluxo e deixar para voce o que realmente merece sua atencao."
-
-SE O LEAD ESTIVER FRIO:
-Gere confiança com clareza e leitura de cenário.
-
-SE O LEAD ESTIVER MORNO:
-Mostre valor de forma mais objetiva e aproxime da solução.
-
-SE O LEAD ESTIVER QUENTE:
-Conduza com segurança para demonstracao, proposta ou proximo passo.
-
-LEMBRE-SE:
-Voce nao vende apenas automacao.
-Voce vende:
-- tempo
-- agilidade
-- organizacao
-- atendimento profissional
-- menos perda de oportunidade
-- mais foco no que realmente pode virar venda
-"""
-
+TEMPO_ESPERA_SEGUNDOS = 7
+MENSAGENS_PROCESSADAS = set()
+TIMERS_RESPOSTA = {}
+LOCK = threading.Lock()
 
 def extrair_texto(payload: dict) -> str:
     text = payload.get("text")
@@ -149,12 +52,37 @@ def extrair_texto(payload: dict) -> str:
     return ""
 
 
+def extrair_url_audio(payload: dict) -> str:
+    audio = payload.get("audio")
+    if isinstance(audio, dict):
+        return (
+            audio.get("audioUrl")
+            or audio.get("url")
+            or audio.get("mediaUrl")
+            or ""
+        ).strip()
+
+    audio_msg = payload.get("audioMessage")
+    if isinstance(audio_msg, dict):
+        return (
+            audio_msg.get("audioUrl")
+            or audio_msg.get("url")
+            or audio_msg.get("mediaUrl")
+            or ""
+        ).strip()
+
+    return (
+        payload.get("audioUrl")
+        or payload.get("mediaUrl")
+        or payload.get("url")
+        or ""
+    ).strip()
+
+
 def enviar_resposta(numero: str, mensagem: str, message_id: Optional[str] = None):
     url = f"https://api.z-api.io/instances/{INSTANCE_ID}/token/{TOKEN}/send-text"
 
-    headers = {
-        "Content-Type": "application/json"
-    }
+    headers = {"Content-Type": "application/json"}
 
     if CLIENT_TOKEN and "COLE_AQUI" not in CLIENT_TOKEN:
         headers["Client-Token"] = CLIENT_TOKEN
@@ -171,6 +99,52 @@ def enviar_resposta(numero: str, mensagem: str, message_id: Optional[str] = None
     return response
 
 
+def gerar_resposta_iara(numero: str, mensagem_cliente: str) -> str:
+    contexto = montar_contexto(numero, mensagem_cliente)
+
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        instructions=SYSTEM_PROMPT_IARA,
+        input=contexto,
+        max_output_tokens=220
+    )
+
+    resposta = (response.output_text or "").strip()
+
+    if not resposta:
+        resposta = "Perfeito 😊 Me confirma só mais um detalhe para eu te ajudar certinho?"
+
+    salvar_no_historico(numero, "cliente", mensagem_cliente)
+    salvar_no_historico(numero, "Iara", resposta)
+
+    return resposta
+
+def processar_resposta_depois(numero: str, message_id: Optional[str] = None):
+    try:
+        mensagem_final = pegar_mensagens_pendentes(numero)
+
+        if not mensagem_final:
+            print("Sem mensagens pendentes para:", numero)
+            return
+
+        reply_text = gerar_resposta_iara(numero, mensagem_final)
+
+        envio = enviar_resposta(numero, reply_text, message_id=message_id)
+
+        print("STATUS ENVIO Z-API:", envio.status_code)
+        print("RESPOSTA Z-API:", envio.text)
+
+    except Exception as e:
+        print("ERRO AO PROCESSAR RESPOSTA:", e)
+
+        try:
+            enviar_resposta(
+                numero,
+                "Tive uma instabilidade aqui agora, mas já continuo com você. Pode me mandar sua mensagem novamente?"
+            )
+        except Exception as envio_erro:
+            print("ERRO AO ENVIAR MENSAGEM DE FALHA:", envio_erro)
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     payload = request.get_json(silent=True) or {}
@@ -183,39 +157,63 @@ def webhook():
         return jsonify({"status": "ignorado_grupo"}), 200
 
     numero = str(payload.get("phone") or "").strip()
-    incoming_msg = extrair_texto(payload)
     message_id = payload.get("messageId")
+
+    if message_id and message_id in MENSAGENS_PROCESSADAS:
+        return jsonify({"status": "mensagem_ja_processada"}), 200
+
+    if message_id:
+        MENSAGENS_PROCESSADAS.add(message_id)
 
     if not numero:
         return jsonify({"status": "sem_numero"}), 200
 
+    incoming_msg = extrair_texto(payload)
+
     if not incoming_msg:
-        return jsonify({"status": "sem_texto"}), 200
+        audio_url = extrair_url_audio(payload)
 
+        if audio_url:
+            try:
+                incoming_msg = transcrever_audio(
+                    audio_url=audio_url,
+                    openai_api_key=OPENAI_API_KEY,
+                    client_token=CLIENT_TOKEN
+                )
+                print("ÁUDIO TRANSCRITO:", incoming_msg)
+            except Exception as erro_audio:
+                print("ERRO AO TRANSCREVER ÁUDIO:", erro_audio)
+                enviar_resposta(
+                    numero,
+                    "Não consegui entender esse áudio agora 😕 Pode me mandar por texto, por favor?",
+                    message_id=message_id
+                )
+                return jsonify({"status": "erro_audio"}), 200
+
+    if not incoming_msg:
+        return jsonify({"status": "sem_texto_ou_audio"}), 200
+
+        
     try:
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            instructions=SYSTEM_PROMPT,
-            input=f"Mensagem do cliente ({numero}): {incoming_msg}",
-            max_output_tokens=180
-        )
+        salvar_mensagem_temporaria(numero, incoming_msg)
 
-        reply_text = (response.output_text or "").strip()
+        with LOCK:
+            timer_antigo = TIMERS_RESPOSTA.get(numero)
 
-        if not reply_text:
-            reply_text = (
-                "Perfeito. Me manda so um pouco mais de contexto para eu te mostrar "
-                "como isso ficaria no seu atendimento."
+            if timer_antigo:
+                timer_antigo.cancel()
+
+            novo_timer = threading.Timer(
+                TEMPO_ESPERA_SEGUNDOS,
+                processar_resposta_depois,
+                args=[numero, message_id]
             )
 
-        envio = enviar_resposta(numero, reply_text, message_id=message_id)
-
-        print("STATUS ENVIO Z-API:", envio.status_code)
-        print("RESPOSTA Z-API:", envio.text)
+            TIMERS_RESPOSTA[numero] = novo_timer
+            novo_timer.start()
 
         return jsonify({
-            "status": "ok",
-            "reply_text": reply_text
+            "status": "mensagem_recebida_aguardando_cliente_parar"
         }), 200
 
     except Exception as e:
@@ -224,13 +222,26 @@ def webhook():
         try:
             enviar_resposta(
                 numero,
-                "Tive uma instabilidade aqui agora, mas ja continuo com voce. "
-                "Me manda sua mensagem novamente em instantes."
+                "Tive uma instabilidade aqui agora, mas já continuo com você. Pode me mandar sua mensagem novamente?"
+            )
+        except Exception as envio_erro:
+            print("ERRO AO ENVIAR MENSAGEM DE FALHA:", envio_erro)
+
+        return jsonify({"status": "erro"}), 200            
+        print("ERRO GERAL:", e)
+
+        try:
+            enviar_resposta(
+                numero,
+                "Tive uma instabilidade aqui agora, mas já continuo com você. Pode me mandar sua mensagem novamente?"
             )
         except Exception as envio_erro:
             print("ERRO AO ENVIAR MENSAGEM DE FALHA:", envio_erro)
 
         return jsonify({"status": "erro"}), 200
+@app.route("/", methods=["GET"])
+def home():
+    return "Iara - WhatsApp IA da Tudo Começa Na Farinha rodando ✅"
 
 
 if __name__ == "__main__":
